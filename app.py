@@ -1,27 +1,37 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
+import numpy as np
+import datetime
+import speech_recognition as sr
+from PIL import Image
 
+from sklearn.ensemble import RandomForestRegressor
+
+# ================= DATABASE =================
+DB_NAME = "health.db"
+
+def get_connection():
+    return sqlite3.connect(DB_NAME, check_same_thread=False)
 
 def init_db():
-    conn = sqlite3.connect("health.db", check_same_thread=False)
+    conn = get_connection()
     c = conn.cursor()
 
     c.execute("""
-    CREATE TABLE IF NOT EXISTS health_metrics (
-        name TEXT,
-        bp INTEGER,
-        sugar INTEGER
+    CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        password TEXT
     )
     """)
 
-    # ✅ FORCE CREATE TABLE (fix)
-    c.execute("DROP TABLE IF EXISTS health")
-
     c.execute("""
-    CREATE TABLE health(
+    CREATE TABLE IF NOT EXISTS health_data (
         name TEXT,
-        steps INTEGER
+        bp INTEGER,
+        sugar INTEGER,
+        heart_rate INTEGER,
+        date TEXT
     )
     """)
 
@@ -30,72 +40,166 @@ def init_db():
 
 init_db()
 
-
-# Insert data
-def insert_data(name, bp, sugar):
-    conn = sqlite3.connect("health.db")
+# ================= AUTH =================
+def register_user(username, password):
+    conn = get_connection()
     c = conn.cursor()
+    try:
+        c.execute("INSERT INTO users VALUES (?, ?)", (username, password))
+        conn.commit()
+        return True
+    except:
+        return False
 
-    # ❌ REMOVED input from here
+def login_user(username, password):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password))
+    return c.fetchone()
 
-    c.execute("INSERT INTO health_metrics VALUES (?, ?, ?)", (name, bp, sugar))
+# ================= ML MODEL =================
+def train_model():
+    conn = get_connection()
+    df = pd.read_sql("SELECT * FROM health_data", conn)
 
-    # ✅ use steps from UI
-    c.execute("INSERT INTO health VALUES (?, ?)", (name, steps))
+    if len(df) < 5:
+        return None
 
-    conn.commit()
-    conn.close()
+    X = df[["bp", "sugar"]]
+    y = df["heart_rate"]
 
+    model = RandomForestRegressor()
+    model.fit(X, y)
+    return model
 
-# Fetch data
-def get_data():
-    conn = sqlite3.connect("health.db")
-    df = pd.read_sql_query("SELECT * FROM health_metrics", conn)
-    conn.close()
-    return df
+# ================= SMS (OPTIONAL) =================
+def send_sms_alert(message):
+    # Twilio setup (optional)
+    """
+    from twilio.rest import Client
 
+    client = Client("ACCOUNT_SID", "AUTH_TOKEN")
+    client.messages.create(
+        body=message,
+        from_="+1234567890",
+        to="+91XXXXXXXXXX"
+    )
+    """
+    print("ALERT:", message)
 
-# UI
-st.title("Healthcare Assistant")
+# ================= VOICE INPUT =================
+def voice_to_text():
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        st.info("Speak now...")
+        audio = recognizer.listen(source)
 
-name = st.text_input("Enter Name")
-bp = st.number_input("Blood Pressure", 0, 300)
-sugar = st.number_input("Sugar Level", 0, 500)
+    try:
+        text = recognizer.recognize_google(audio)
+        return text
+    except:
+        return "Could not understand audio"
 
-# ✅ FIX: moved here
-steps = st.number_input("Enter steps walked")
-calories = st.number_input("Calories burned")
+# ================= IMAGE ANALYSIS =================
+def analyze_image(image):
+    img = Image.open(image)
+    img = img.resize((200, 200))
+    return f"Image uploaded successfully. Size: {img.size}"
 
-if st.button("Save Data"):
-    insert_data(name, bp, sugar)
-    st.success("Data saved successfully!")
+# ================= UI =================
+st.set_page_config(page_title="Health AI Platform", layout="wide")
 
+menu = ["Login", "Register", "Dashboard"]
+choice = st.sidebar.selectbox("Menu", menu)
 
-# Show table
-st.subheader("Stored Data")
-st.dataframe(get_data())
+# ---------------- REGISTER ----------------
+if choice == "Register":
+    st.title("Register")
 
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
 
-# Show steps table
-conn = sqlite3.connect("health.db")
+    if st.button("Register"):
+        if register_user(username, password):
+            st.success("Account created!")
+        else:
+            st.error("User already exists")
 
-try:
-    df = pd.read_sql_query("select * from health", conn)
-    st.write("Steps Data")
+# ---------------- LOGIN ----------------
+elif choice == "Login":
+    st.title("Login")
+
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+
+    if st.button("Login"):
+        if login_user(username, password):
+            st.session_state["user"] = username
+            st.success("Login successful!")
+        else:
+            st.error("Invalid credentials")
+
+# ---------------- DASHBOARD ----------------
+elif choice == "Dashboard":
+
+    if "user" not in st.session_state:
+        st.warning("Please login first")
+        st.stop()
+
+    st.title("🏥 Health Dashboard")
+
+    user = st.session_state["user"]
+
+    # INPUT
+    st.subheader("Enter Health Data")
+
+    bp = st.number_input("Blood Pressure")
+    sugar = st.number_input("Sugar")
+    heart_rate = st.number_input("Heart Rate")
+
+    if st.button("Save"):
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO health_data VALUES (?, ?, ?, ?, ?)",
+            (user, bp, sugar, heart_rate, str(datetime.date.today()))
+        )
+        conn.commit()
+        st.success("Saved!")
+
+        if bp > 140 or sugar > 180:
+            send_sms_alert("Health Alert!")
+
+    # VIEW DATA
+    st.subheader("Your Data")
+
+    conn = get_connection()
+    df = pd.read_sql("SELECT * FROM health_data WHERE name=?", conn, params=(user,))
     st.dataframe(df)
-except:
-    st.warning("No data yet")
 
-conn.close()
-st.subheader("Health Chart")
+    # ML PREDICTION
+    st.subheader("AI Prediction")
 
-df = get_data()
+    model = train_model()
 
-if not df.empty:
-    st.line_chart(df)
-goal = st.number_input("Set Step Goal")
+    if model:
+        pred = model.predict([[bp, sugar]])
+        st.success(f"Predicted Heart Rate: {pred[0]:.2f}")
+    else:
+        st.info("Not enough data")
 
-if steps >= goal:
-    st.success("Goal completed 🎉")
-else:
-    st.warning("Try more steps")
+    # VOICE
+    st.subheader("Voice Input")
+
+    if st.button("Start Voice"):
+        text = voice_to_text()
+        st.write(text)
+
+    # IMAGE
+    st.subheader("Upload Medical Image")
+
+    file = st.file_uploader("Upload Image", type=["jpg", "png", "jpeg"])
+
+    if file:
+        st.image(file)
+        st.success(analyze_image(file))     
